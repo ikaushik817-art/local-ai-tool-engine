@@ -28,6 +28,9 @@ ${notes.map((note) => `  * ${note}`).join("\n").slice(0, 1200)}` : ""}`;
 const TOOL_ANSWER_RULES = `The tool results above are real output. Use them to answer the user's latest question in plain language.
 If the results don't contain the answer, say so instead of guessing. Don't dump raw JSON and don't mention "tool results" unless it helps. If a tool returned an error, say briefly what went wrong and what the user could try.`;
 
+// Small models love to "fill in" from memory. For research, keep them on the pages we actually read.
+const RESEARCH_RULES = `This is a research answer. Use ONLY the page excerpts above. Don't add facts from your own memory and don't make up code examples. Keep it under about 150 words. If the excerpts don't answer the question, say so.`;
+
 function formatSearchResults(results) {
     if (!Array.isArray(results) || results.length === 0) {
         return "No relevant search results found. Try a clearer search query.";
@@ -340,7 +343,7 @@ export function createToolEngine(model, registry = toolRegistry, { memory = defa
 
         let problem = "";
         let answer = await tryGenerate(model, [
-            { role: "system", content: `${prompt()}\n\n${TOOL_ANSWER_RULES}` },
+            { role: "system", content: `${prompt()}\n\n${TOOL_ANSWER_RULES}${used.some((u) => u.tool.name === "research") ? `\n${RESEARCH_RULES}` : ""}` },
             ...memory.getMessages()
         ], (why) => { problem = why; });
 
