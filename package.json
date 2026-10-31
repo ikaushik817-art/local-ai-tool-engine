@@ -1,0 +1,51 @@
+{
+  "name": "create-local-ai-tool",
+  "version": "1.0.0",
+  "description": "L.A.T.E. (Local AI Tool Engine): give any local or API model real tools. One-command setup for Ollama, LM Studio and OpenAI-compatible APIs.",
+  "main": "sdk.js",
+  "scripts": {
+    "setup": "node setup.js",
+    "start": "node setup.js --if-needed && node index.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "local-llm",
+    "ollama",
+    "tool-calling",
+    "ai",
+    "sdk"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "expr-eval": "^2.0.2"
+  },
+  "exports": {
+    ".": "./sdk.js",
+    "./cli": "./index.js"
+  },
+  "files": [
+    "setup.js",
+    "sdk.js",
+    "model.js",
+    "config.js",
+    "memory.js",
+    "engine/",
+    "adapters/",
+    "tools/",
+    "index.js",
+    "example.js",
+    "README.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "create-local-ai-tool.js"
+  ],
+  "bin": {
+    "create-local-ai-tool": "./create-local-ai-tool.js"
+  }
+}
