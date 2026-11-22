@@ -27,7 +27,8 @@
   },
   "dependencies": {
     "cheerio": "^1.2.0",
-    "expr-eval": "^2.0.2"
+    "expr-eval": "^2.0.2",
+    "undici": "^6.29.1"
   },
   "exports": {
     ".": "./sdk.js",
