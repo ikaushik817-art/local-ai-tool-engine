@@ -93,13 +93,13 @@ test("ollama: selectTool parses fenced JSON and rejects junk", async () => {
 test("openai adapter: works against /chat/completions, optional key, optional model", async () => {
     const s = await fakeServer(() => ({ body: { choices: [{ message: { content: "Hi from LM Studio" }, finish_reason: "stop" }] } }));
     try {
-        const out = await createOpenAIAdapter({ baseURL: `${s.url}/v1/`, apiKey: "k" }).generate(user);
+        const out = await createOpenAIAdapter({ baseURL: `${s.url}/v1/`, apiKey: "k", model: "" }).generate(user); // model: "" so a model set in your .env can't leak into the test
         assert.equal(out.content, "Hi from LM Studio");
         assert.equal(s.seen[0].url, "/v1/chat/completions");
         assert.equal(s.seen[0].headers.authorization, "Bearer k");
         assert.equal("model" in s.seen[0].body, false);
 
-        await createOpenAIAdapter({ baseURL: s.url, model: "x" }).generate(user);
+        await createOpenAIAdapter({ baseURL: s.url, model: "x", apiKey: "" }).generate(user); // apiKey: "" so a key in your .env can't leak into the test
         assert.equal(s.seen[1].headers.authorization, undefined);
         assert.equal(s.seen[1].body.model, "x");
     } finally { await s.close(); }
@@ -199,12 +199,14 @@ test("search: parses results, and reports blocked / failed / offline", async () 
     const ok = await withFetch(async () => new Response(html), () => webSearch("react hooks"));
     assert.deepEqual(ok.map((r) => r.link), ["https://react.dev/learn"]);
 
+    // A different question each time: the first one was a success and is now remembered for ten minutes,
+    // so asking it again would never reach the (fake) failing server.
     await withFetch(async () => new Response("", { status: 202 }), () =>
-        assert.rejects(webSearch("react hooks"), /rate-limiting/));
+        assert.rejects(webSearch("vue composition api"), /rate-limiting/));
     await withFetch(async () => new Response("", { status: 500 }), () =>
-        assert.rejects(webSearch("react hooks"), /failed \(500\)/));
+        assert.rejects(webSearch("svelte stores guide"), /failed \(500\)/));
     await withFetch(async () => { throw new TypeError("fetch failed"); }, () =>
-        assert.rejects(webSearch("react hooks"), /Couldn't reach/));
+        assert.rejects(webSearch("angular signals guide"), /Couldn't reach/));
     assert.deepEqual(await webSearch("asdfghjklqwerty123456"), []);
 });
 
@@ -241,4 +243,35 @@ test("ollama: thinking that never finishes is retried with more room, then used"
 test("cleanReply: an unfinished <think> block leaves nothing", () => {
     assert.equal(cleanReply("<think>still going"), "");
     assert.equal(cleanReply("<think>a</think>ok<think>b"), "ok");
+});
+
+// ---- small models that break the JSON once ----
+
+test("selectTool: one broken JSON reply is repaired by asking again", async () => {
+    const replies = ["Sure! I would use the echo tool.", '{"tool":"echo","arguments":{"a":1}}'];
+    const s = await fakeServer(() => ({ body: { message: { content: replies.shift() } } }));
+    try {
+        const out = await createOllamaAdapter({ baseURL: s.url }).selectTool(user, [{ name: "echo", description: "", parameters: {} }]);
+        assert.deepEqual(out, { type: "tool_call", tool: "echo", arguments: { a: 1 } });
+        assert.equal(s.seen.length, 2);
+        const retry = s.seen[1].body.messages;
+        assert.equal(retry.at(-2).content, "Sure! I would use the echo tool.");
+        assert.match(retry.at(-1).content, /not valid JSON/);
+    } finally { await s.close(); }
+});
+
+test("selectTool: two broken replies in a row still fail clearly, after exactly two tries", async () => {
+    const s = await fakeServer(() => ({ body: { message: { content: "no json here" } } }));
+    try {
+        await assert.rejects(createOllamaAdapter({ baseURL: s.url }).selectTool(user, [{ name: "echo", description: "", parameters: {} }]), /invalid tool-selection JSON/);
+        assert.equal(s.seen.length, 2);
+    } finally { await s.close(); }
+});
+
+test("selectTool: a good first reply costs only one request", async () => {
+    const s = await fakeServer(() => ({ body: { choices: [{ message: { content: '{"tool":"none"}' } }] } }));
+    try {
+        await createOpenAIAdapter({ baseURL: s.url }).selectTool(user, [{ name: "echo", description: "", parameters: {} }]);
+        assert.equal(s.seen.length, 1);
+    } finally { await s.close(); }
 });

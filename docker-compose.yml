@@ -1,0 +1,18 @@
+# docker compose up --build   then open http://127.0.0.1:3737
+# The port is published to 127.0.0.1 ONLY. Do not change that to 0.0.0.0 or a public address.
+services:
+  late:
+    build: .
+    ports: ["127.0.0.1:3737:3737"]
+    volumes: ["late-data:/data"]
+    environment:
+      AI_PROVIDER: ${AI_PROVIDER:-ollama}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    restart: unless-stopped
+volumes:
+  late-data:

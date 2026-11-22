@@ -46,7 +46,9 @@ for (const [name, content] of Object.entries(files)) {
 console.log(`\nCreated ${projectName}.`);
 console.log('Installing project dependencies...');
 const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-const install = spawnSync(npm, ['install'], { cwd: projectDir, stdio: 'inherit', shell: process.platform === 'win32' });
+const install = process.platform === 'win32'
+  ? spawnSync('npm install', { cwd: projectDir, stdio: 'inherit', shell: true }) // npm.cmd needs a shell; one command string, no args array
+  : spawnSync(npm, ['install'], { cwd: projectDir, stdio: 'inherit' });
 if (install.status !== 0) {
   console.error('\nDependency installation failed. Check your internet connection and run "npm install" inside the project folder.');
   process.exit(1);

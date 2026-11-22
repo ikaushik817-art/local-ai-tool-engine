@@ -2,8 +2,8 @@
 // One-command setup:  node setup.js   (or: npm run setup)
 // Installs deps, finds your model (Ollama / LM Studio / API key), saves .env, sends a test message.
 // Only uses Node built-ins, so it works before `npm install`.
-import { existsSync, writeFileSync, chmodSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { existsSync, writeFileSync, chmodSync, readFileSync, appendFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
 import readline from "node:readline/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
@@ -34,17 +34,73 @@ async function getJson(url, { headers = {}, timeoutMs = 2500 } = {}) {
     return response.json();
 }
 
+// Why a server didn't answer, in words a person can act on.
+export function whyNoAnswer(error) {
+    const code = error?.cause?.code ?? error?.code;
+    if (code === "ECONNREFUSED") return "nothing is listening there (the server isn't running)";
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") return "no answer in time";
+    if (error?.status) return `it answered with HTTP ${error.status}`;
+    return error?.message ?? "no answer";
+}
+
+// "localhost" can mean IPv6 (::1) while the server only listens on 127.0.0.1 (Ollama does), so try both spellings.
+// OLLAMA_HOST (what Ollama itself uses to change its address) is honoured too.
+export function candidateURLs(url, extra = []) {
+    const list = [url, ...extra.filter(Boolean)];
+    if (/\/\/localhost\b/i.test(url)) list.push(url.replace(/\/\/localhost\b/i, "//127.0.0.1"));
+    return [...new Set(list.map((u) => u.replace(/\/+$/, "")))];
+}
+function ollamaHostEnv() {
+    const host = process.env.OLLAMA_HOST?.trim();
+    if (!host) return null;
+    const withScheme = /^https?:\/\//i.test(host) ? host : `http://${host}`;
+    return withScheme.replace(/\/\/0\.0\.0\.0\b/, "//127.0.0.1");
+}
+
 export async function detectLocal({ ollamaURL = OLLAMA_URL, lmURL = LMSTUDIO_URL } = {}) {
     const found = { ollama: null, lmstudio: null };
-    try {
-        const data = await getJson(`${ollamaURL}/api/tags`);
-        found.ollama = { baseURL: ollamaURL, models: (data.models ?? []).map((m) => m.name) };
-    } catch { /* not running */ }
-    try {
-        const data = await getJson(`${lmURL}/models`);
-        found.lmstudio = { baseURL: lmURL, models: (data.data ?? []).map((m) => m.id) };
-    } catch { /* not running */ }
+    const tried = [];
+    for (const url of candidateURLs(ollamaURL, [ollamaHostEnv()])) {
+        try {
+            const data = await getJson(`${url}/api/tags`, { timeoutMs: 4000 });
+            found.ollama = { baseURL: url, models: (data.models ?? []).map((m) => m.name) };
+            break;
+        } catch (error) { tried.push({ what: "Ollama", url, reason: whyNoAnswer(error) }); }
+    }
+    for (const url of candidateURLs(lmURL)) {
+        try {
+            const data = await getJson(`${url}/models`, { timeoutMs: 4000 });
+            found.lmstudio = { baseURL: url, models: (data.data ?? []).map((m) => m.id) };
+            break;
+        } catch (error) { tried.push({ what: "LM Studio", url, reason: whyNoAnswer(error) }); }
+    }
+    Object.defineProperty(found, "tried", { value: found.ollama && found.lmstudio ? [] : tried, enumerable: false });
     return found;
+}
+
+// Is the Ollama program installed (even if its server isn't running)?
+export function ollamaInstalled() {
+    try { return spawnSync("ollama", ["--version"], { stdio: "ignore", timeout: 8000 }).status === 0; } catch { return false; } // ollama is a program, not a script: no shell needed
+}
+
+// Starts `ollama serve` in the background and waits until it answers.
+export async function startOllama({ waitMs = 20000, say = () => {} } = {}) {
+    let stopped = null;
+    try {
+        const child = spawn("ollama", ["serve"], { detached: true, stdio: "ignore", windowsHide: true });
+        child.on("error", (error) => { stopped = error.message; });
+        child.on("exit", (code) => { stopped = `\`ollama serve\` stopped right away (exit code ${code})`; });
+        child.unref();
+    } catch (error) { say(`Couldn't start Ollama: ${error.message}`); return null; }
+    const until = Date.now() + waitMs;
+    for (let seconds = 1; Date.now() < until; seconds++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        const found = await detectLocal();
+        if (found.ollama) return found.ollama;
+        if (stopped) { say(`${stopped}.`); return null; }
+        if (seconds % 5 === 0) say(`  still waiting for Ollama (${seconds}s)...`);
+    }
+    return null;
 }
 
 // Speech, embedding, image and safety models can't chat.
@@ -69,8 +125,12 @@ export function buildEnv({ provider, baseURL, model, apiKey }) {
     return `${lines.join("\n")}\n`;
 }
 
+// npm is a .cmd file on Windows, so it needs a shell, and with a shell Node wants one command string (not an args array).
+// Real programs (ollama, node) don't need one.
 function run(command, args) {
-    return spawnSync(command, args, { cwd: here, stdio: "inherit", shell: isWindows });
+    return isWindows && command === "npm"
+        ? spawnSync(`npm ${args.join(" ")}`, { cwd: here, stdio: "inherit", shell: true })
+        : spawnSync(command, args, { cwd: here, stdio: "inherit" });
 }
 
 async function main() {
@@ -94,6 +154,14 @@ async function main() {
     }
 
     const interactive = Boolean(process.stdin.isTTY);
+    // PDFs need one small extra library. Ask once; `npm start` adds it.
+    const offerPdf = async () => {
+        if (!interactive || /^AI_PDF\s*=\s*on/im.test(readFileSync(envPath, "utf8"))) return;
+        const answer = (await ask("Read PDF files too? It adds one small library (about 1 MB). y/n", "y")).toLowerCase();
+        if (answer.startsWith("n")) return;
+        appendFileSync(envPath, "AI_PDF=on\n");
+        console.log("Okay. It will be added when you start.");
+    };
     const rl = interactive ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null;
     const ask = async (question, fallback = "") => {
         if (!rl) return fallback;
@@ -116,16 +184,30 @@ async function main() {
         }
 
         console.log("Looking for a local model...");
-        const found = await detectLocal();
+        let found = await detectLocal();
+        if (!found.ollama && interactive && ollamaInstalled()) {
+            const tried = found.tried.filter((t) => t.what === "Ollama");
+            console.log("Ollama is installed, but I couldn't reach its server:");
+            for (const t of tried) console.log(`  - ${t.url}: ${t.reason}`);
+            if (tried.every((t) => /isn't running/.test(t.reason)) && /^y/i.test(await ask("Start it now? (Y/n)", "y"))) {
+                console.log("Starting Ollama (this can take a few seconds)...");
+                const started = await startOllama({ say: (message) => console.log(message) });
+                if (started) found = await detectLocal();
+                else console.log("It didn't start in time. Open the Ollama app (or run `ollama serve` in another terminal), then run this again.");
+            }
+        }
         const options = [];
         if (found.ollama) options.push({ id: "ollama", label: `Ollama (running, ${found.ollama.models.length} model(s) installed)` });
         if (found.lmstudio) options.push({ id: "lmstudio", label: "LM Studio (server running)" });
+        options.push({ id: "custom", label: "My local server is at another address (type it)" });
         options.push({ id: "api", label: "Use an API key (OpenAI, Groq, OpenRouter, Gemini...)" });
 
         if (!found.ollama && !found.lmstudio) {
-            console.log("No local model found. Install Ollama (https://ollama.com) or start LM Studio's server and re-run this, or just use an API key below.\n");
+            console.log("No local model found. What I checked:");
+            for (const t of found.tried) console.log(`  - ${t.what} at ${t.url}: ${t.reason}`);
+            console.log("Start Ollama (open the app, or run `ollama serve`) or start LM Studio's server (Developer tab, Start Server), then run this again. Or pick another option below.\n");
         }
-        if (!interactive && options[0].id === "api") {
+        if (!interactive && options[0].id === "custom") {
             console.log("Not an interactive terminal and no local model found. Run `npm run setup` in a normal terminal.");
             process.exit(1);
         }
@@ -146,6 +228,17 @@ async function main() {
             const preferred = models.includes(DEFAULT_OLLAMA_MODEL) ? DEFAULT_OLLAMA_MODEL : pickModel(models);
             if (models.length > 1) console.log(`Installed: ${models.join(", ")}`);
             settings = { provider: "ollama", baseURL: found.ollama.baseURL, model: await ask("Model", preferred) };
+        } else if (choice === "custom") {
+            const raw = (await ask("Address of your server, like http://192.168.1.5:11434 (Ollama) or http://localhost:1234/v1 (LM Studio)")).replace(/\/+$/, "");
+            if (!/^https?:\/\//i.test(raw)) { console.log("That doesn't look like an address (it should start with http:// or https://)."); process.exit(1); }
+            let kind = null; let ids = [];
+            try { ids = ((await getJson(`${raw}/api/tags`, { timeoutMs: 6000 })).models ?? []).map((m) => m.name); kind = "ollama"; } catch { /* not Ollama */ }
+            if (!kind) {
+                try { ids = ((await getJson(`${raw.endsWith("/v1") ? raw : `${raw}/v1`}/models`, { timeoutMs: 6000 })).data ?? []).map((m) => m.id); kind = "lmstudio"; }
+                catch (error) { console.log(`Couldn't reach ${raw}: ${whyNoAnswer(error)}.`); process.exit(1); }
+            }
+            const base = kind === "ollama" ? raw : (raw.endsWith("/v1") ? raw : `${raw}/v1`);
+            settings = { provider: kind, baseURL: base, model: await ask("Model", ids.length ? pickModel(ids) : "") };
         } else if (choice === "lmstudio") {
             const models = found.lmstudio.models;
             if (models.length === 0) console.log("LM Studio is running but no model is loaded. Load one there before chatting.");
@@ -195,6 +288,7 @@ async function main() {
                 const adapter = createModelAdapter(settings.provider, settings);
                 const reply = await adapter.generate([{ role: "user", content: "Reply with the single word: ready" }]);
                 console.log(`Model says: ${String(reply.content).slice(0, 80) || "(empty reply)"}`);
+                await offerPdf();
                 console.log("\nAll set! Start chatting with:  npm start\n");
                 break;
             } catch (error) {

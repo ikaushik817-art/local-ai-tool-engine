@@ -10,7 +10,7 @@ import { createToolRegistry } from "../tools/registry.js";
 import { createToolEngine, guessToolCall, findNamedTool } from "../engine/toolEngine.js";
 import { createMemory } from "../memory.js";
 import { createOpenAIAdapter } from "../adapters/openai.adapter.js";
-import { pickModel, buildEnv, detectLocal, isChatModel } from "../setup.js";
+import { pickModel, buildEnv, detectLocal, isChatModel, candidateURLs, whyNoAnswer } from "../setup.js";
 
 // A throwaway folder that read_file is allowed to look at.
 const root = mkdtempSync(path.join(os.tmpdir(), "ai-tool-"));
@@ -107,7 +107,8 @@ test("engine: file content reaches the model, which writes the answer", async ()
 test("engine: a missing file gives a clear error, not a confused model", async () => {
     const { engine, calls } = engineWith();
     const answer = await engine.run("read notes-missing.txt and summarize it");
-    assert.match(answer, /^read_file failed: Couldn't find "notes-missing\.txt"/);
+    assert.match(answer, /Couldn't find "notes-missing\.txt"/);
+    assert.match(answer, /^I stopped at step 1 because/);
     assert.equal(calls.length, 0);
 });
 
@@ -229,4 +230,29 @@ test("openai adapter: retries with max_completion_tokens, explains bad keys", as
         mode = "badKey";
         await assert.rejects(adapter.generate([{ role: "user", content: "hi" }]), /rejected the API key/);
     } finally { server.closeAllConnections?.(); await new Promise((r) => server.close(r)); }
+});
+
+test("setup: a server that only listens on 127.0.0.1 is found even when 'localhost' is the address that was tried (IPv6 trap)", async () => {
+    const server = http.createServer((req, res) => { res.setHeader("Content-Type", "application/json"); res.end(JSON.stringify(req.url === "/api/tags" ? { models: [{ name: "qwen2.5:3b" }] } : {})); });
+    await new Promise((r) => server.listen(0, "127.0.0.1", r));
+    try {
+        const port = server.address().port;
+        const found = await detectLocal({ ollamaURL: `http://localhost:${port}`, lmURL: "http://127.0.0.1:1" });
+        assert.deepEqual(found.ollama.models, ["qwen2.5:3b"]);
+        assert.match(found.ollama.baseURL, /^http:\/\/(?:localhost|127\.0\.0\.1):\d+$/);
+    } finally { server.closeAllConnections?.(); await new Promise((r) => server.close(r)); }
+    assert.deepEqual(candidateURLs("http://localhost:11434/"), ["http://localhost:11434", "http://127.0.0.1:11434"]);
+    assert.deepEqual(candidateURLs("http://127.0.0.1:1234/v1"), ["http://127.0.0.1:1234/v1"]);
+});
+
+test("setup: when nothing answers, it says what was checked and why, instead of just 'no local model found'", async () => {
+    const none = await detectLocal({ ollamaURL: "http://127.0.0.1:1", lmURL: "http://localhost:1/v1" });
+    assert.equal(none.ollama, null);
+    const reasons = none.tried.map((t) => `${t.what} ${t.url}`);
+    assert.ok(reasons.includes("Ollama http://127.0.0.1:1"));
+    assert.ok(reasons.includes("LM Studio http://localhost:1/v1") && reasons.includes("LM Studio http://127.0.0.1:1/v1"), reasons.join("; "));
+    assert.ok(none.tried.every((t) => typeof t.reason === "string" && t.reason.length > 5));
+    assert.match(whyNoAnswer(Object.assign(new Error("fetch failed"), { cause: { code: "ECONNREFUSED" } })), /isn't running/);
+    assert.match(whyNoAnswer(Object.assign(new Error("x"), { name: "TimeoutError" })), /no answer in time/);
+    assert.match(whyNoAnswer(Object.assign(new Error("x"), { status: 404 })), /HTTP 404/);
 });

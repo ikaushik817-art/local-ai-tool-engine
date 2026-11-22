@@ -1,0 +1,8 @@
+node_modules
+.git
+.env
+logs
+ai-output
+.ai-memory.json
+.ai-history.json
+evals/last-report.md

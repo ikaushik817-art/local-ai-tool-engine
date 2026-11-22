@@ -26,6 +26,7 @@ export function calculate(expression) {
         .replace(/÷/g, "/")
         .replace(/\*\*/g, "^")
         .replace(/(?<=\d),(?=\d{3}\b)/g, "") // 1,000 -> 1000
+        .replace(/(\d+(?:\.\d+)?)\s*(?:%|percent)\s*of\s+/gi, "($1/100)*") // "15% of 80" -> (15/100)*80
         // "20%" means 20/100, but "10%3" is still a remainder.
         .replace(/(\d+(?:\.\d+)?)%(?!\s*[\d(])/g, "($1/100)");
 

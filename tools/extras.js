@@ -17,24 +17,71 @@ const trimText = (text) =>
 // Files the model should never see, even inside the allowed folder.
 export const SECRET_PATH = /(^|[\\/])(\.env(\..*)?|\.git|\.ssh|\.aws|node_modules|id_rsa[^\\/]*|[^\\/]*\.(pem|key|pfx|p12))([\\/]|$)/i;
 
-export async function readFile({ path: requested } = {}) {
+// Finds a file or folder inside the allowed folder, safely. Files the assistant saved live in ai-output,
+// so a plain name like "test.txt" is looked for there too.
+export async function locate(requested) {
     if (typeof requested !== "string" || !requested.trim()) throw new Error("A file or folder path is required.");
 
     const root = await fs.realpath(path.resolve(config.filesDir));
-    const target = path.resolve(root, requested.trim().replace(/^~[\\/]/, ""));
+    const clean = requested.trim().replace(/^~[\\/]/, "");
 
     let real;
     try {
-        real = await fs.realpath(target);
+        real = await fs.realpath(path.resolve(root, clean));
     } catch {
-        throw new Error(`Couldn't find "${requested}" inside ${root}.`);
+        try {
+            real = await fs.realpath(path.resolve(root, "ai-output", clean));
+        } catch {
+            throw new Error(`Couldn't find "${requested}" inside ${root}.`);
+        }
     }
 
-    const rel = path.relative(root, real);
+    const rel = path.relative(root, real).split(path.sep).join("/"); // same look on Windows and elsewhere
     if (rel.startsWith("..") || path.isAbsolute(rel)) {
         throw new Error(`"${requested}" is outside the allowed folder (${root}). Set AI_FILES_DIR to change it.`);
     }
     if (SECRET_PATH.test(rel)) throw new Error("That file looks like a secret or system file, so it's blocked.");
+    return { root, real, rel };
+}
+
+// PDFs need a small reader library, installed on purpose: npm install pdf-parse@1.1.1
+const MAX_PDF_BYTES = 10 * 1024 * 1024;
+let pdfParser = null; // tests put a fake one here
+export const setPdfParser = (fn) => { pdfParser = fn; };
+
+async function pdfText(real, stat) {
+    if (stat.size > MAX_PDF_BYTES) throw new Error("That PDF is bigger than 10 MB.");
+    let parse = pdfParser;
+    if (!parse) {
+        try {
+            const module = await import("pdf-parse/lib/pdf-parse.js").catch(() => import("pdf-parse"));
+            parse = module.default ?? module;
+        } catch {
+            throw new Error("To read PDFs, install the PDF reader once: npm install pdf-parse@1.1.1");
+        }
+    }
+    let data;
+    try { data = await parse(await fs.readFile(real)); } catch { throw new Error("I couldn't read that PDF. It may be damaged or protected with a password."); }
+    const text = String(data?.text ?? "").replace(/\r/g, "").replace(/\n{3,}/g, "\n\n").trim();
+    if (!text) throw new Error("That PDF has no text I can read. It may be a scan (pictures of pages), which needs OCR.");
+    return text;
+}
+
+async function readRaw(real, stat) {
+    if (path.extname(real).toLowerCase() === ".pdf") return pdfText(real, stat);
+    const handle = await fs.open(real, "r");
+    try {
+        const buffer = Buffer.alloc(Math.min(stat.size, MAX_FILE_BYTES));
+        await handle.read(buffer, 0, buffer.length, 0);
+        if (buffer.subarray(0, 8000).includes(0)) throw new Error("That looks like a binary file (PDF, image, etc.). Only text files are supported.");
+        return buffer.toString("utf8");
+    } finally {
+        await handle.close();
+    }
+}
+
+export async function readFile({ path: requested } = {}) {
+    const { real, rel } = await locate(requested);
 
     const stat = await fs.stat(real);
     if (stat.isDirectory()) {
@@ -46,16 +93,35 @@ export async function readFile({ path: requested } = {}) {
         return { folder: rel || ".", items: names };
     }
 
-    const handle = await fs.open(real, "r");
-    try {
-        const buffer = Buffer.alloc(Math.min(stat.size, MAX_FILE_BYTES));
-        await handle.read(buffer, 0, buffer.length, 0);
-        if (buffer.subarray(0, 8000).includes(0)) throw new Error("That looks like a binary file (PDF, image, etc.). Only text files are supported.");
-        const text = trimText(buffer.toString("utf8"));
-        return { file: rel, size: stat.size, content: text };
-    } finally {
-        await handle.close();
+    return { file: rel, size: stat.size, content: trimText(await readRaw(real, stat)) };
+}
+
+// The whole text of a file (up to 200 KB), for tools that need exact numbers about it.
+export async function readFileText(requested) {
+    const { real, rel } = await locate(requested);
+    const stat = await fs.stat(real);
+    if (stat.isDirectory()) throw new Error(`"${requested}" is a folder, not a file.`);
+    return { file: rel, text: await readRaw(real, stat) };
+}
+
+// Everything in a folder at once, one short line per file. Handy for "which file has the biggest number".
+export async function readFiles({ folder = "ai-output" } = {}) {
+    const { real, rel } = await locate(String(folder || "ai-output"));
+    const stat = await fs.stat(real);
+    if (!stat.isDirectory()) throw new Error(`"${folder}" is a file. Use read_file for a single file.`);
+
+    const lines = [];
+    let skipped = 0;
+    for (const entry of (await fs.readdir(real, { withFileTypes: true })).sort((x, y) => x.name.localeCompare(y.name, undefined, { numeric: true }))) {
+        if (!entry.isFile() || SECRET_PATH.test(entry.name)) continue;
+        if (lines.length >= 30) { skipped++; continue; }
+        try {
+            const text = await readRaw(path.join(real, entry.name), await fs.stat(path.join(real, entry.name)));
+            lines.push(`${entry.name}: ${text.replace(/\s+/g, " ").trim().slice(0, 300)}`);
+        } catch { skipped++; } // binary or unreadable
     }
+    if (lines.length === 0) return `No text files in ${rel || "."}.`;
+    return `${lines.length} file${lines.length === 1 ? "" : "s"} in ${rel || "."}${skipped ? ` (${skipped} skipped)` : ""}:\n${lines.join("\n")}`;
 }
 
 // ---------- read_webpage ----------
@@ -84,7 +150,24 @@ async function assertPublicUrl(raw) {
     return url;
 }
 
-export async function readWebpage({ url } = {}) {
+// Remembers the answer for a while, and gives callers who ask at the same moment the same answer (one request, not two).
+export function memoize(produce, { ttlMs = 600000, max = 50 } = {}) {
+    const memo = new Map();
+    return (key, ...args) => {
+        const hit = memo.get(key);
+        if (hit && Date.now() - hit.at < ttlMs) return hit.value.then(structuredClone);
+        const value = produce(...args);
+        memo.set(key, { at: Date.now(), value });
+        if (memo.size > max) memo.delete(memo.keys().next().value);
+        value.catch(() => memo.get(key)?.value === value && memo.delete(key)); // only answers that worked are kept
+        return value.then(structuredClone);
+    };
+}
+
+const pageMemo = memoize((url) => fetchWebpage({ url }));
+export const readWebpage = ({ url } = {}) => (typeof url === "string" && url.trim() ? pageMemo(url.trim(), url) : fetchWebpage({ url }));
+
+async function fetchWebpage({ url } = {}) {
     if (typeof url !== "string" || !url.trim()) throw new Error("A URL is required.");
 
     let current = await assertPublicUrl(url.trim());

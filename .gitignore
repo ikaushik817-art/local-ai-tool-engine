@@ -9,3 +9,9 @@ coverage/
 
 .ai-memory.json
 .ai-memory.json.tmp
+ai-output/
+logs/
+.ai-history.json
+.ai-history.json.tmp
+evals/last-report.md
+.ai-history-web.json

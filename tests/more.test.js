@@ -208,7 +208,7 @@ test("engine: date/time and file search answer exactly, without the model", asyn
 });
 
 test("engine: research goes through the model and ends with sources, not a dump", async () => {
-    const { engine, registry } = engineWith({ generate: () => ({ content: "Hooks let function components use state." }) });
+    const { engine, registry, calls } = engineWith({ generate: () => ({ content: "Hooks let function components use state." }) });
     registry.getTool("research").execute = async () => ({
         question: "q",
         sources: [{ title: "React Docs", link: "https://react.dev/learn", excerpt: "text" }]
@@ -216,6 +216,7 @@ test("engine: research goes through the model and ends with sources, not a dump"
     const answer = await engine.run("research how react hooks work");
     assert.match(answer, /^Hooks let function components use state\./);
     assert.match(answer, /Sources:\n- React Docs: https:\/\/react\.dev\/learn/);
+    assert.match(calls[0][0].content, /Use ONLY the page excerpts/, "research answers are kept to the pages that were read");
 });
 
 test("engine: research with a dead model lists the pages instead of raw JSON", async () => {
@@ -252,4 +253,106 @@ test("engine: normal web search and files still work next to the new tools", asy
     const { engine, registry } = engineWith({ generate: () => ({ content: "Search summary." }) });
     registry.getTool("web_search").execute = async () => [{ title: "R", description: "react hooks", link: "https://react.dev/x" }];
     assert.match(await engine.run("search for react hooks"), /^Search summary\./);
+});
+
+// ---- convert ----
+
+import { convert, findUnit, weather } from "../tools/more.js";
+
+test("convert: length, mass, volume, speed, data, time", () => {
+    assert.equal(convert({ value: 5, from: "km", to: "miles" }), "5 km = 3.10686 miles");
+    assert.equal(convert({ value: 10, from: "in", to: "cm" }), "10 in = 25.4 cm");
+    assert.equal(convert({ value: 1, from: "kg", to: "lbs" }), "1 kg = 2.20462 lbs");
+    assert.equal(convert({ value: 1, from: "gallon", to: "liters" }), "1 gallon = 3.78541 liters");
+    assert.equal(convert({ value: 3, from: "m/s", to: "km/h" }), "3 m/s = 10.8 km/h");
+    assert.equal(convert({ value: 1, from: "GB", to: "MB" }), "1 GB = 1000 MB");
+    assert.equal(convert({ value: 1, from: "GiB", to: "MiB" }), "1 GiB = 1024 MiB");
+    assert.equal(convert({ value: 2, from: "hours", to: "minutes" }), "2 hours = 120 minutes");
+});
+
+test("convert: temperature both ways, and nothing below absolute zero", () => {
+    assert.equal(convert({ value: 100, from: "C", to: "F" }), "100 C = 212 F");
+    assert.equal(convert({ value: 32, from: "°F", to: "celsius" }), "32 °F = 0 celsius");
+    assert.equal(convert({ value: 0, from: "c", to: "k" }), "0 c = 273.15 k");
+    assert.throws(() => convert({ value: -300, from: "c", to: "f" }), /absolute zero/);
+});
+
+test("convert: mixed categories, unknown units and bad numbers are explained", () => {
+    assert.throws(() => convert({ value: 5, from: "km", to: "kg" }), /can't convert length to mass/);
+    assert.throws(() => convert({ value: 5, from: "apples", to: "kg" }), /don't know the unit "apples"/);
+    assert.throws(() => convert({ value: 5, from: "km", to: "banana" }), /don't know the unit "banana"/);
+    assert.throws(() => convert({ value: "abc", from: "km", to: "mi" }), /number to convert/);
+    assert.throws(() => convert({ from: "km", to: "mi" }), /number to convert/);
+    assert.equal(convert({ value: "1,000", from: "m", to: "km" }), "1000 m = 1 km");
+    assert.equal(findUnit("apples"), null);
+    assert.equal(findUnit("constructor"), null, "inherited object keys are not units");
+});
+
+test("routing: conversions need two real units, weather needs a place and the present", () => {
+    const { registry } = engineWith();
+    const pick = (q) => guessLocalTool(q, registry);
+    assert.deepEqual(pick("convert 5 km to miles"), { tool: "convert", args: { value: "5", from: "km", to: "miles" } });
+    assert.deepEqual(pick("what is 100 f in c"), { tool: "convert", args: { value: "100", from: "f", to: "c" } });
+    assert.deepEqual(pick("how much is 3 m/s in km/h?"), { tool: "convert", args: { value: "3", from: "m/s", to: "km/h" } });
+    assert.deepEqual(pick("what's the weather in New Delhi today?"), { tool: "weather", args: { city: "New Delhi" } });
+    assert.deepEqual(pick("temperature in Mumbai"), { tool: "weather", args: { city: "Mumbai" } });
+
+    for (const q of ["5 apples in basket", "what is 5 + 3", "weather tomorrow in Delhi", "weather forecast for next week in Pune", "how hot is it", "I live in 5 km"]) {
+        assert.equal(pick(q), null, q);
+    }
+});
+
+test("engine: a conversion answers exactly and without the model", async () => {
+    const { engine, calls } = engineWith();
+    assert.equal(await engine.run("convert 5 km to miles"), "5 km = 3.10686 miles");
+    assert.equal(await engine.run("how many hours is 120 minutes"), "model answer", "not a pattern we claim, so it's left to the model");
+    assert.equal(calls.length, 1);
+});
+
+// ---- weather ----
+
+const geo = { results: [{ name: "Delhi", country: "India", latitude: 28.65, longitude: 77.23 }] };
+const now = { current: { temperature_2m: 24.3, apparent_temperature: 25.1, relative_humidity_2m: 62, wind_speed_10m: 8.2, weather_code: 2 }, current_units: { temperature_2m: "°C", apparent_temperature: "°C", wind_speed_10m: "km/h" } };
+
+test("weather: builds one readable line and asks the right URLs", async () => {
+    const urls = [];
+    const out = await weather({ city: "Delhi" }, { getJson: async (url) => { urls.push(url); return url.includes("geocoding") ? geo : now; } });
+    assert.equal(out, "Delhi, India: partly cloudy, 24.3°C (feels like 25.1°C), humidity 62%, wind 8.2 km/h.");
+    assert.match(urls[0], /name=Delhi&count=1/);
+    assert.match(urls[1], /latitude=28\.65&longitude=77\.23&current=/);
+});
+
+test("weather: unknown city, odd replies, network errors and weird input", async () => {
+    await assert.rejects(weather({ city: "Nowhereville" }, { getJson: async () => ({}) }), /couldn't find a place called "Nowhereville"/);
+    await assert.rejects(weather({ city: "Delhi" }, { getJson: async (url) => (url.includes("geocoding") ? geo : { current: {} }) }), /can't read/);
+    await assert.rejects(weather({ city: "Delhi" }, { getJson: async () => { throw new Error("Couldn't reach the weather service."); } }), /Couldn't reach/);
+    await assert.rejects(weather({ city: "  " }), /which city/);
+    const urls = [];
+    await weather({ city: "a&b=c#x" }, { getJson: async (url) => { urls.push(url); return url.includes("geocoding") ? geo : now; } });
+    assert.ok(urls[0].includes("name=a%26b%3Dc%23x"), "the city can't inject extra URL parameters");
+});
+
+test("weather: real network failures become friendly messages", async () => {
+    const original = globalThis.fetch;
+    try {
+        globalThis.fetch = async () => { throw new TypeError("fetch failed"); };
+        await assert.rejects(weather({ city: "Delhi" }), /Couldn't reach the weather service/);
+        globalThis.fetch = async () => new Response("", { status: 500 });
+        await assert.rejects(weather({ city: "Delhi" }), /error \(500\)/);
+    } finally { globalThis.fetch = original; }
+});
+
+// ---- live progress in normal chat ----
+
+test("engine: normal chat reports which tool is running", async () => {
+    const { engine } = engineWith();
+    const events = [];
+    await engine.run("what time is it?", { onStep: (e) => events.push(`${e.type}:${e.tool}${e.ok === undefined ? "" : `:${e.ok}`}`) });
+    assert.deepEqual(events, ["step:datetime", "result:datetime:true"]);
+
+    const calc = [];
+    await engine.run("what is 245 * 37?", { onStep: (e) => calc.push(`${e.type}:${e.tool}:${e.summary ?? ""}`) });
+    assert.deepEqual(calc, ["step:calculator:", "result:calculator:9065"]);
+
+    assert.equal(await engine.run("what is 2 + 2?", { onStep: () => { throw new Error("my bug"); } }), "2 + 2 = 4", "a broken callback can't break the answer");
 });
